@@ -6,7 +6,7 @@ import {PayrollFactory} from "../src/PayrollFactory.sol";
 
 contract Deploy is Script {
     // Salt mined to produce 0xB0b0B0B0... vanity address for deployer 0x7E193027A78eD1FC92df6f462f3260bcb3317E34.
-    bytes32 constant SALT = 0x3ac656ce1d52cbf5911ca8e6596ae385cfb53a4dfb0e1693a897d4d125b235a6;
+    bytes32 constant SALT = 0x765b2eeca105c488f618ea6b7c187f8ae932d7b3dab10fa6c0298f4655082e48;
 
     function run() external {
         address deployer = vm.envAddress("DEPLOYER_ADDRESS");
@@ -29,7 +29,7 @@ contract Deploy is Script {
         assembly {
             factoryAddr := shr(96, mload(add(ret, 32)))
         }
-        require(factoryAddr == 0xB0b0B0B023CD2C869D307f86A32544E1270E526a, "unexpected address");
+        require(factoryAddr == 0xb0b0B0b01B86aef0B0B801e447FF8Dfc9cC20f37, "unexpected address");
 
         PayrollFactory factory = PayrollFactory(factoryAddr);
         console.log("PayrollFactory deployed at:", address(factory));

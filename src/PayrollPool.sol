@@ -18,7 +18,7 @@ import {IPayrollFactory} from "./interfaces/IPayrollFactory.sol";
 /// When admin edits an allocation the active tranche is sealed at block.timestamp
 /// and a new tranche is pushed. Accrual math per tranche:
 ///
-///   accrued = floor((min(endTime, now) - startTime) / periodSeconds) * amountPerPeriod
+///   accrued = (floor((min(endTime, now) - startTime) / periodSeconds) + 1) * amountPerPeriod
 ///
 /// Total claimable = sum(accrued over all tranches) - alreadyClaimed
 ///
@@ -427,7 +427,8 @@ contract PayrollPool is Ownable, ReentrancyGuard {
     ///      periods elapsed within [startTime, effectiveEnd], then multiply by rate.
     ///
     ///      effectiveEnd = endTime if sealed, else block.timestamp.
-    ///      If effectiveEnd <= startTime no full period has elapsed → 0 for that tranche.
+    ///      The first period is claimable at startTime itself (not after one full period).
+    ///      If effectiveEnd < startTime nothing is claimable from that tranche.
     ///
     ///      Invariant: tranches are non-overlapping and ordered by creation time.
     ///      Sealed tranche[i].endTime == tranche[i+1] creation time (block.timestamp
@@ -446,10 +447,10 @@ contract PayrollPool is Ownable, ReentrancyGuard {
             // effectiveEnd: use block.timestamp for the active (last) tranche.
             uint256 effectiveEnd = t.endTime == 0 ? block.timestamp : t.endTime;
 
-            // No full period can elapse if effectiveEnd hasn't passed startTime.
-            if (effectiveEnd <= t.startTime) continue;
+            // First claim is available at startTime itself (period 1 of 1).
+            if (effectiveEnd < t.startTime) continue;
 
-            uint256 periods = (effectiveEnd - t.startTime) / t.periodSeconds;
+            uint256 periods = (effectiveEnd - t.startTime) / t.periodSeconds + 1;
             totalAccrued += periods * t.amountPerPeriod;
         }
 

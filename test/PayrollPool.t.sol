@@ -136,9 +136,9 @@ contract PayrollPoolTest is Test {
         pool.depositToken(address(usdt), 10_000e18);
 
         vm.prank(admin);
-        pool.setAllocation(alice, address(usdt), 6_000e18, PayrollPool.Frequency.MONTHLY, block.timestamp);
+        pool.setAllocation(alice, address(usdt), 3_000e18, PayrollPool.Frequency.MONTHLY, block.timestamp);
 
-        vm.warp(block.timestamp + MONTH); // 6000 committed
+        vm.warp(block.timestamp + MONTH); // 6000 committed (2 periods), 4000 available
 
         vm.prank(admin);
         vm.expectRevert(PayrollPool.AmountExceedsAvailable.selector);
@@ -248,24 +248,24 @@ contract PayrollPoolTest is Test {
         vm.prank(admin);
         pool.setAllocation(alice, address(usdt), 2_000e18, PayrollPool.Frequency.MONTHLY, start);
 
-        // After 2 months: 4000 accrued in tranche 0
+        // After 2 months: 3 payments (at start, start+MONTH, start+2*MONTH) → 6000 accrued in tranche 0
         vm.warp(start + 2 * MONTH);
-        assertEq(pool.claimableAmount(alice, address(usdt)), 4_000e18);
+        assertEq(pool.claimableAmount(alice, address(usdt)), 6_000e18);
 
         // Admin raises rate to 3000/month starting now
         vm.prank(admin);
         pool.setAllocation(alice, address(usdt), 3_000e18, PayrollPool.Frequency.MONTHLY, block.timestamp);
 
-        // Tranche 0 sealed at 2*MONTH → 4000 still owed; tranche 1 not yet elapsed
-        assertEq(pool.claimableAmount(alice, address(usdt)), 4_000e18);
+        // Tranche 0 sealed at 2*MONTH → 6000 still owed; tranche 1 immediately yields 1 period → 9000
+        assertEq(pool.claimableAmount(alice, address(usdt)), 9_000e18);
 
-        // 1 month into tranche 1 → 4000 + 3000 = 7000
+        // 1 month into tranche 1 → 6000 + 6000 = 12000
         vm.warp(block.timestamp + MONTH);
-        assertEq(pool.claimableAmount(alice, address(usdt)), 7_000e18);
+        assertEq(pool.claimableAmount(alice, address(usdt)), 12_000e18);
 
-        // 2nd month in tranche 1 → 4000 + 6000 = 10000
+        // 2nd month in tranche 1 → 6000 + 9000 = 15000
         vm.warp(block.timestamp + MONTH);
-        assertEq(pool.claimableAmount(alice, address(usdt)), 10_000e18);
+        assertEq(pool.claimableAmount(alice, address(usdt)), 15_000e18);
     }
 
     function test_editAllocation_newStartInFuture_gapIsNotAccrued() public {
@@ -276,20 +276,20 @@ contract PayrollPoolTest is Test {
         vm.prank(admin);
         pool.setAllocation(alice, address(usdt), 2_000e18, PayrollPool.Frequency.MONTHLY, start);
 
-        vm.warp(start + MONTH); // 2000 accrued in tranche 0
+        vm.warp(start + MONTH); // 2 payments (at start, start+MONTH) → 4000 accrued in tranche 0
 
         // New tranche starts 30 days from now (gap between old endTime and new startTime)
         uint256 newStart = block.timestamp + MONTH;
         vm.prank(admin);
         pool.setAllocation(alice, address(usdt), 3_000e18, PayrollPool.Frequency.MONTHLY, newStart);
 
-        // During the gap — still only 2000 from tranche 0
+        // During the gap — still only 4000 from tranche 0
         vm.warp(newStart - 1);
-        assertEq(pool.claimableAmount(alice, address(usdt)), 2_000e18);
+        assertEq(pool.claimableAmount(alice, address(usdt)), 4_000e18);
 
-        // 1 period after new tranche start → 2000 + 3000 = 5000
+        // 1 period after new tranche start → 4000 + 6000 = 10000
         vm.warp(newStart + MONTH);
-        assertEq(pool.claimableAmount(alice, address(usdt)), 5_000e18);
+        assertEq(pool.claimableAmount(alice, address(usdt)), 10_000e18);
     }
 
     function test_editAllocation_partialPeriodNotCounted() public {
@@ -301,14 +301,14 @@ contract PayrollPoolTest is Test {
         vm.prank(admin);
         pool.setAllocation(alice, address(usdt), 1_000e18, PayrollPool.Frequency.MONTHLY, start);
 
-        // Seal halfway through month 2 → only 1 full period counted in tranche 0
+        // Seal halfway through month 2 → floor(1.5) + 1 = 2 periods counted in tranche 0
         vm.warp(start + MONTH + MONTH / 2);
         vm.prank(admin);
         pool.setAllocation(alice, address(usdt), 500e18, PayrollPool.Frequency.MONTHLY, block.timestamp);
 
-        // Tranche 0: 1 full period (floor of 1.5 months) → 1000
-        // Tranche 1: 0 full periods elapsed yet → 0
-        assertEq(pool.claimableAmount(alice, address(usdt)), 1_000e18);
+        // Tranche 0: 2 periods (partial month discarded by floor) → 2000
+        // Tranche 1: 1 period immediately at its startTime → 500
+        assertEq(pool.claimableAmount(alice, address(usdt)), 2_500e18);
     }
 
     function test_claimedAmountNotDoubleCountedAfterEdit() public {
@@ -319,21 +319,20 @@ contract PayrollPoolTest is Test {
         vm.prank(admin);
         pool.setAllocation(alice, address(usdt), 1_000e18, PayrollPool.Frequency.MONTHLY, start);
 
-        vm.warp(start + 2 * MONTH); // 2000 accrued
+        vm.warp(start + 2 * MONTH); // 3 periods accrued → 3000
 
         vm.prank(alice);
-        pool.claim(address(usdt)); // claims 2000; _claimed = 2000
+        pool.claim(address(usdt)); // claims 3000; _claimed = 3000
 
-        // Admin changes rate
+        // Admin changes rate; tranche 1 immediately yields 1 period → 500 claimable
         vm.prank(admin);
         pool.setAllocation(alice, address(usdt), 500e18, PayrollPool.Frequency.MONTHLY, block.timestamp);
 
-        // Nothing extra immediately
-        assertEq(pool.claimableAmount(alice, address(usdt)), 0);
-
-        // 1 period in new tranche
-        vm.warp(block.timestamp + MONTH);
         assertEq(pool.claimableAmount(alice, address(usdt)), 500e18);
+
+        // 1 more period in new tranche → 1000 claimable
+        vm.warp(block.timestamp + MONTH);
+        assertEq(pool.claimableAmount(alice, address(usdt)), 1_000e18);
     }
 
     // =========================================================================
@@ -352,10 +351,10 @@ contract PayrollPoolTest is Test {
         vm.prank(admin);
         pool.removeAllocation(alice, address(usdt));
 
-        assertEq(pool.claimableAmount(alice, address(usdt)), 2_000e18);
+        assertEq(pool.claimableAmount(alice, address(usdt)), 4_000e18);
 
         vm.warp(block.timestamp + 10 * MONTH);
-        assertEq(pool.claimableAmount(alice, address(usdt)), 2_000e18);
+        assertEq(pool.claimableAmount(alice, address(usdt)), 4_000e18);
     }
 
     function test_removeAllocation_remainsClaimable() public {
@@ -372,7 +371,7 @@ contract PayrollPoolTest is Test {
 
         vm.prank(alice);
         pool.claim(address(usdt));
-        assertEq(usdt.balanceOf(alice), 6_000e18); // no fee set
+        assertEq(usdt.balanceOf(alice), 8_000e18); // no fee set
     }
 
     function test_removeAllocation_revertsIfNotActive() public {
@@ -417,7 +416,7 @@ contract PayrollPoolTest is Test {
         vm.prank(alice);
         pool.claim(address(usdt));
 
-        assertEq(usdt.balanceOf(alice), 2_000e18);
+        assertEq(usdt.balanceOf(alice), 4_000e18);
         assertEq(pool.claimableAmount(alice, address(usdt)), 0);
     }
 
@@ -430,11 +429,11 @@ contract PayrollPoolTest is Test {
         pool.setAllocation(alice, address(usdt), 1_000e18, PayrollPool.Frequency.WEEKLY, start);
 
         vm.warp(start + 4 * WEEK);
-        assertEq(pool.claimableAmount(alice, address(usdt)), 4_000e18);
+        assertEq(pool.claimableAmount(alice, address(usdt)), 5_000e18);
 
         vm.prank(alice);
         pool.claim(address(usdt));
-        assertEq(usdt.balanceOf(alice), 4_000e18);
+        assertEq(usdt.balanceOf(alice), 5_000e18);
 
         vm.warp(block.timestamp + 2 * WEEK);
         assertEq(pool.claimableAmount(alice, address(usdt)), 2_000e18);
@@ -455,8 +454,8 @@ contract PayrollPoolTest is Test {
         vm.prank(alice);
         pool.claim(address(usdt));
 
-        assertEq(usdt.balanceOf(alice), 9_900e18);
-        assertEq(factory.accruedFees(address(usdt)), 100e18);
+        assertEq(usdt.balanceOf(alice), 19_800e18);
+        assertEq(factory.accruedFees(address(usdt)), 200e18);
     }
 
     function test_claim_ETH() public {
@@ -472,7 +471,7 @@ contract PayrollPoolTest is Test {
         uint256 balBefore = alice.balance;
         vm.prank(alice);
         pool.claim(address(0));
-        assertEq(alice.balance - balBefore, 1 ether);
+        assertEq(alice.balance - balBefore, 2 ether);
     }
 
     function test_claim_revertsNothingToClaim() public {
@@ -519,7 +518,7 @@ contract PayrollPoolTest is Test {
 
         vm.prank(alice);
         pool.claim(address(usdt));
-        assertEq(usdt.balanceOf(alice), 2_000e18);
+        assertEq(usdt.balanceOf(alice), 4_000e18);
     }
 
     function test_claim_revertsPoolUnderfunded() public {
@@ -553,8 +552,8 @@ contract PayrollPoolTest is Test {
         vm.prank(bob);
         pool.claim(address(usdt));
 
-        assertEq(usdt.balanceOf(alice), 2_000e18);
-        assertEq(usdt.balanceOf(bob),   1_000e18);
+        assertEq(usdt.balanceOf(alice), 4_000e18);
+        assertEq(usdt.balanceOf(bob),   2_000e18);
     }
 
     function test_committedAmountBlocksAdminWithdraw() public {
@@ -567,14 +566,11 @@ contract PayrollPoolTest is Test {
         pool.setAllocation(bob,   address(usdt), 2_000e18, PayrollPool.Frequency.MONTHLY, start);
         vm.stopPrank();
 
-        vm.warp(start + MONTH); // 4000 committed total
+        vm.warp(start + MONTH); // 8000 committed total (4000 each), pool only has 5000
 
         vm.prank(admin);
         vm.expectRevert(PayrollPool.AmountExceedsAvailable.selector);
-        pool.adminWithdraw(address(usdt), 2_000e18);
-
-        vm.prank(admin);
-        pool.adminWithdraw(address(usdt), 1_000e18);
+        pool.adminWithdraw(address(usdt), 1e18); // nothing available — all 5000 is committed
     }
 
     // =========================================================================
@@ -590,7 +586,7 @@ contract PayrollPoolTest is Test {
         pool.setAllocation(alice, address(usdt), 500e18, PayrollPool.Frequency.WEEKLY, start);
 
         vm.warp(start + 3 * WEEK);
-        assertEq(pool.claimableAmount(alice, address(usdt)), 1_500e18);
+        assertEq(pool.claimableAmount(alice, address(usdt)), 2_000e18);
     }
 
     function test_quarterlyFrequency() public {
@@ -602,7 +598,7 @@ contract PayrollPoolTest is Test {
         pool.setAllocation(alice, address(usdt), 12_000e18, PayrollPool.Frequency.QUARTERLY, start);
 
         vm.warp(start + 2 * QUARTER);
-        assertEq(pool.claimableAmount(alice, address(usdt)), 24_000e18);
+        assertEq(pool.claimableAmount(alice, address(usdt)), 36_000e18);
     }
 
     function test_futureStartTime_nothingBeforeStart() public {
@@ -616,11 +612,11 @@ contract PayrollPoolTest is Test {
         vm.warp(start - 1);
         assertEq(pool.claimableAmount(alice, address(usdt)), 0);
 
-        vm.warp(start); // exactly at start — 0 full periods elapsed
-        assertEq(pool.claimableAmount(alice, address(usdt)), 0);
-
-        vm.warp(start + MONTH);
+        vm.warp(start); // first claim available at startTime
         assertEq(pool.claimableAmount(alice, address(usdt)), 2_000e18);
+
+        vm.warp(start + MONTH); // second claim
+        assertEq(pool.claimableAmount(alice, address(usdt)), 4_000e18);
     }
 
     // =========================================================================
@@ -716,7 +712,7 @@ contract PayrollPoolTest is Test {
 
         vm.prank(alice);
         pool.claim(address(usdt));
-        assertEq(usdt.balanceOf(alice), 4_000e18);
+        assertEq(usdt.balanceOf(alice), 6_000e18);
     }
 
     function test_closePool_adminCanWithdrawExcess() public {
@@ -727,14 +723,14 @@ contract PayrollPoolTest is Test {
         vm.prank(admin);
         pool.setAllocation(alice, address(usdt), 2_000e18, PayrollPool.Frequency.MONTHLY, start);
 
-        vm.warp(start + MONTH); // 2000 committed to alice
+        vm.warp(start + MONTH); // 4000 committed to alice (periods 0 and 1)
         vm.prank(admin);
         pool.closePool();
 
         uint256 balBefore = usdt.balanceOf(admin);
         vm.prank(admin);
-        pool.adminWithdraw(address(usdt), 8_000e18);
-        assertEq(usdt.balanceOf(admin) - balBefore, 8_000e18);
+        pool.adminWithdraw(address(usdt), 6_000e18);
+        assertEq(usdt.balanceOf(admin) - balBefore, 6_000e18);
     }
 
     function test_closePool_revertsIfAlreadyClosed() public {
@@ -838,7 +834,7 @@ contract PayrollPoolTest is Test {
 
         vm.prank(alice);
         pool.claim(address(usdt));
-        assertEq(usdt.balanceOf(alice), 2_000e18);
+        assertEq(usdt.balanceOf(alice), 4_000e18);
     }
 
     function test_closePool_autoUnpausesSoClaimsWork() public {
@@ -862,7 +858,7 @@ contract PayrollPoolTest is Test {
 
         vm.prank(alice);
         pool.claim(address(usdt));
-        assertEq(usdt.balanceOf(alice), 2_000e18);
+        assertEq(usdt.balanceOf(alice), 4_000e18);
     }
 
     // =========================================================================
@@ -873,10 +869,10 @@ contract PayrollPoolTest is Test {
         amount  = bound(amount, 1e6, 1_000_000e18);
         periods = uint8(bound(periods, 1, 24));
 
-        usdt.mint(admin, amount * periods);
+        usdt.mint(admin, amount * (uint256(periods) + 1));
         vm.startPrank(admin);
         usdt.approve(address(pool), type(uint256).max);
-        pool.depositToken(address(usdt), amount * periods);
+        pool.depositToken(address(usdt), amount * (uint256(periods) + 1));
         vm.stopPrank();
 
         uint256 start = block.timestamp;
@@ -884,7 +880,7 @@ contract PayrollPoolTest is Test {
         pool.setAllocation(alice, address(usdt), amount, PayrollPool.Frequency.MONTHLY, start);
 
         vm.warp(start + uint256(periods) * MONTH);
-        assertEq(pool.claimableAmount(alice, address(usdt)), amount * periods);
+        assertEq(pool.claimableAmount(alice, address(usdt)), amount * (uint256(periods) + 1));
     }
 
     function testFuzz_claimNeverExceedsBalance(uint256 depositAmount, uint256 allocAmount, uint8 periods) public {
