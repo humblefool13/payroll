@@ -38,6 +38,9 @@ contract PayrollFactory is Ownable, ReentrancyGuard {
     /// @notice Platform fee in basis points (e.g. 50 = 0.5%).
     uint256 public feeBps;
 
+    /// @notice Whitelisted tokens array
+    address[] public whitelistedTokens;
+
     /// @notice Accumulated fees per token (address(0) = ETH).
     mapping(address token => uint256 amount) public accruedFees;
 
@@ -60,7 +63,11 @@ contract PayrollFactory is Ownable, ReentrancyGuard {
     event PoolDeployed(address indexed pool, address indexed admin);
     event FeeBpsSet(uint256 oldFeeBps, uint256 newFeeBps);
     event TokenWhitelisted(address indexed token);
-    event FeeCollected(address indexed token, address indexed to, uint256 amount);
+    event FeeCollected(
+        address indexed token,
+        address indexed to,
+        uint256 amount
+    );
 
     // -------------------------------------------------------------------------
     // Constructor
@@ -85,17 +92,21 @@ contract PayrollFactory is Ownable, ReentrancyGuard {
     function whitelistToken(address token) external onlyOwner {
         if (tokenWhitelisted[token]) revert AlreadyWhitelisted();
         tokenWhitelisted[token] = true;
+        whitelistedTokens.push(token);
         emit TokenWhitelisted(token);
     }
 
     /// @notice Pull all accrued platform fees for `token` to address `to`.
-    function collectFees(address token, address payable to) external onlyOwner nonReentrant {
+    function collectFees(
+        address token,
+        address payable to
+    ) external onlyOwner nonReentrant {
         uint256 amount = accruedFees[token];
         if (amount == 0) revert NothingToCollect();
         accruedFees[token] = 0;
         emit FeeCollected(token, to, amount);
         if (token == address(0)) {
-            (bool ok,) = to.call{value: amount}("");
+            (bool ok, ) = to.call{value: amount}("");
             if (!ok) revert ETHTransferFailed();
         } else {
             IERC20(token).safeTransfer(to, amount);
@@ -128,7 +139,8 @@ contract PayrollFactory is Ownable, ReentrancyGuard {
     /// @notice Record a fee accrual from a pool. ETH fees arrive with msg.value.
     function recordFee(address token, uint256 amount) external payable {
         if (!isDeployedPool[msg.sender]) revert NotAValidPool();
-        if (token == address(0) && msg.value != amount) revert ETHValueMismatch();
+        if (token == address(0) && msg.value != amount)
+            revert ETHValueMismatch();
         accruedFees[token] += amount;
     }
 
@@ -136,11 +148,19 @@ contract PayrollFactory is Ownable, ReentrancyGuard {
     // Views
     // -------------------------------------------------------------------------
 
-    function getAdminPools(address admin) external view returns (address[] memory) {
+    function getAdminPools(
+        address admin
+    ) external view returns (address[] memory) {
         return _adminPools[admin];
     }
 
-    function getBeneficiaryPools(address beneficiary) external view returns (address[] memory) {
+    function getBeneficiaryPools(
+        address beneficiary
+    ) external view returns (address[] memory) {
         return _beneficiaryPools[beneficiary];
+    }
+
+    function getWhitelistedTokens() external view returns (address[] memory) {
+        return whitelistedTokens;
     }
 }
