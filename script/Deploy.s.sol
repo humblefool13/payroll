@@ -6,7 +6,8 @@ import {PayrollFactory} from "../src/PayrollFactory.sol";
 
 contract Deploy is Script {
     // Salt mined to produce 0xB0b0B0B0... vanity address for deployer 0x7E193027A78eD1FC92df6f462f3260bcb3317E34.
-    bytes32 constant SALT = 0x765b2eeca105c488f618ea6b7c187f8ae932d7b3dab10fa6c0298f4655082e48;
+    bytes32 constant SALT =
+        0x5d1cb6f92e64ce8a038dd321dd56c9c6bddeb7a288b59124028af8af301a9bcb;
 
     function run() external {
         address deployer = vm.envAddress("DEPLOYER_ADDRESS");
@@ -16,20 +17,27 @@ contract Deploy is Script {
         uint256 initialFeeBps = vm.envOr("INITIAL_FEE_BPS", uint256(0));
 
         // Optional: comma-separated whitelisted token addresses beyond ETH
-        // e.g. WHITELIST_TOKENS=0xdAC17F958D2ee523a2206206994597C13D831ec7,0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48
         string memory tokenList = vm.envOr("WHITELIST_TOKENS", string(""));
 
         vm.startBroadcast(deployerKey);
 
-        bytes memory initCode = abi.encodePacked(type(PayrollFactory).creationCode, abi.encode(deployer));
-        (bool ok, bytes memory ret) = CREATE2_FACTORY.call(abi.encodePacked(SALT, initCode));
+        bytes memory initCode = abi.encodePacked(
+            type(PayrollFactory).creationCode,
+            abi.encode(deployer)
+        );
+        (bool ok, bytes memory ret) = CREATE2_FACTORY.call(
+            abi.encodePacked(SALT, initCode)
+        );
         require(ok, "CREATE2 deployment failed");
         require(ret.length == 20, "unexpected return length");
         address factoryAddr;
         assembly {
             factoryAddr := shr(96, mload(add(ret, 32)))
         }
-        require(factoryAddr == 0xb0b0B0b01B86aef0B0B801e447FF8Dfc9cC20f37, "unexpected address");
+        require(
+            factoryAddr == 0xB0b0B0b0561Ff8Be504787aF00C611f9a9Bd6EFa,
+            "unexpected address"
+        );
 
         PayrollFactory factory = PayrollFactory(factoryAddr);
         console.log("PayrollFactory deployed at:", address(factory));
@@ -52,7 +60,9 @@ contract Deploy is Script {
     }
 
     /// @dev Minimal comma-separated address parser for up to 20 tokens.
-    function _parseAddresses(string memory input) internal pure returns (address[] memory) {
+    function _parseAddresses(
+        string memory input
+    ) internal pure returns (address[] memory) {
         bytes memory b = bytes(input);
         uint256 count = 1;
         for (uint256 i = 0; i < b.length; i++) {
@@ -77,7 +87,10 @@ contract Deploy is Script {
 
     function _parseAddress(string memory s) internal pure returns (address) {
         bytes memory b = bytes(s);
-        require(b.length == 42 && b[0] == "0" && b[1] == "x", "invalid address");
+        require(
+            b.length == 42 && b[0] == "0" && b[1] == "x",
+            "invalid address"
+        );
         uint160 addr = 0;
         for (uint256 i = 2; i < 42; i++) {
             addr *= 16;
