@@ -86,12 +86,13 @@ contract PayrollPoolTest is Test {
         vm.stopPrank();
     }
 
-    function test_deposit_revertsOnClosed() public {
+    function test_deposit_allowedOnClosed() public {
         vm.prank(admin);
         pool.closePool();
+        // Deposits remain open after close so underfunded pools can be rescued.
         vm.prank(admin);
-        vm.expectRevert(PayrollPool.PoolClosedError.selector);
         pool.depositToken(address(usdt), 1000e18);
+        assertEq(pool.poolBalance(address(usdt)), 1000e18);
     }
 
     function test_depositToken_useDepositETHForZeroAddress() public {
@@ -741,12 +742,44 @@ contract PayrollPoolTest is Test {
         pool.closePool();
     }
 
-    function test_closePool_revertsNewDeposit() public {
+    function test_closePool_allowsDepositToRescueUnderfundedBeneficiary() public {
+        // Scenario: pool closes underfunded — Carol cannot claim because Alice and Bob
+        // claimed first. Admin tops up after close so Carol can claim. No funds locked.
+        address carol = makeAddr("carol");
+
+        vm.prank(admin);
+        pool.depositToken(address(usdt), 8_000e18); // only covers 2 of 3 × 4k claimable
+
+        uint256 start = block.timestamp;
+        vm.startPrank(admin);
+        pool.setAllocation(alice, address(usdt), 2_000e18, PayrollPool.Frequency.MONTHLY, start);
+        pool.setAllocation(bob,   address(usdt), 2_000e18, PayrollPool.Frequency.MONTHLY, start);
+        pool.setAllocation(carol, address(usdt), 2_000e18, PayrollPool.Frequency.MONTHLY, start);
+        vm.stopPrank();
+
+        vm.warp(start + MONTH); // 2 periods each → 4k claimable each; 12k committed, 8k in pool
+
         vm.prank(admin);
         pool.closePool();
+
+        vm.prank(alice);
+        pool.claim(address(usdt)); // pool: 8k → 4k ✓
+        vm.prank(bob);
+        pool.claim(address(usdt)); // pool: 4k → 0 ✓
+
+        // Carol is locked out — first-come-first-served exhausted the pool
+        vm.prank(carol);
+        vm.expectRevert(PayrollPool.PoolUnderfunded.selector);
+        pool.claim(address(usdt));
+
+        // Admin tops up AFTER close — deposits are now allowed on closed pools
         vm.prank(admin);
-        vm.expectRevert(PayrollPool.PoolClosedError.selector);
-        pool.depositToken(address(usdt), 1000e18);
+        pool.depositToken(address(usdt), 4_000e18);
+
+        // Carol can now claim — no funds permanently locked
+        vm.prank(carol);
+        pool.claim(address(usdt));
+        assertEq(usdt.balanceOf(carol), 4_000e18);
     }
 
     function test_closePool_revertsNewAllocation() public {
@@ -859,6 +892,266 @@ contract PayrollPoolTest is Test {
         vm.prank(alice);
         pool.claim(address(usdt));
         assertEq(usdt.balanceOf(alice), 4_000e18);
+    }
+
+    // =========================================================================
+    // SC-01: Phantom period prevention
+    // =========================================================================
+
+    function test_phantomPeriod_preventedWhenSealedAtStart() public {
+        vm.prank(admin);
+        pool.depositToken(address(usdt), 10_000e18);
+
+        // Create allocation with startTime = block.timestamp (allowed by current design)
+        vm.prank(admin);
+        pool.setAllocation(alice, address(usdt), 1_000e18, PayrollPool.Frequency.MONTHLY, block.timestamp);
+
+        // Immediately supersede in the same block — seals Tranche 0 with endTime == startTime.
+        // Before the fix this granted 1 phantom period from Tranche 0.
+        vm.prank(admin);
+        pool.setAllocation(alice, address(usdt), 2_000e18, PayrollPool.Frequency.MONTHLY, block.timestamp);
+
+        // Tranche 0 (sealed at own startTime) → 0 periods.
+        // Tranche 1 (active, effectiveEnd == startTime) → 1 period (intended first-period design).
+        assertEq(pool.claimableAmount(alice, address(usdt)), 2_000e18);
+    }
+
+    // =========================================================================
+    // SC-05: Beneficiary cap
+    // =========================================================================
+
+    function test_maxBeneficiaries_reverts() public {
+        uint256 cap = pool.MAX_BENEFICIARIES();
+        vm.startPrank(admin);
+        for (uint256 i = 1; i <= cap; i++) {
+            pool.setAllocation(
+                address(uint160(i)),
+                address(usdt),
+                1e18,
+                PayrollPool.Frequency.MONTHLY,
+                block.timestamp + 1
+            );
+        }
+        vm.expectRevert(PayrollPool.TooManyBeneficiaries.selector);
+        pool.setAllocation(
+            address(uint160(cap + 1)),
+            address(usdt),
+            1e18,
+            PayrollPool.Frequency.MONTHLY,
+            block.timestamp + 1
+        );
+        vm.stopPrank();
+    }
+
+    // =========================================================================
+    // SC-05: evictBeneficiary — slot recycling
+    // =========================================================================
+
+    function test_evictBeneficiary_freesSlot() public {
+        vm.prank(admin);
+        pool.depositToken(address(usdt), 100_000e18);
+
+        vm.prank(admin);
+        pool.setAllocation(alice, address(usdt), 1_000e18, PayrollPool.Frequency.MONTHLY, block.timestamp);
+
+        vm.warp(block.timestamp + MONTH);
+
+        vm.prank(admin);
+        pool.removeAllocation(alice, address(usdt));
+
+        vm.prank(alice);
+        pool.claim(address(usdt)); // claims all, claimable → 0
+
+        uint256 lenBefore = pool.getBeneficiaries().length;
+        vm.prank(admin);
+        pool.evictBeneficiary(alice);
+
+        assertEq(pool.getBeneficiaries().length, lenBefore - 1);
+    }
+
+    function test_evictBeneficiary_allowsNewBeneficiaryAfterEviction() public {
+        vm.prank(admin);
+        pool.depositToken(address(usdt), 100_000e18);
+
+        // Fill pool to cap
+        uint256 cap = pool.MAX_BENEFICIARIES();
+        vm.startPrank(admin);
+        for (uint256 i = 1; i <= cap; i++) {
+            pool.setAllocation(address(uint160(i)), address(usdt), 1e18, PayrollPool.Frequency.MONTHLY, block.timestamp + 1);
+        }
+        vm.stopPrank();
+
+        // Evict address(1): remove allocation (starts in future → 0 claimable)
+        vm.prank(admin);
+        pool.removeAllocation(address(1), address(usdt));
+        vm.prank(admin);
+        pool.evictBeneficiary(address(1));
+
+        // Now slot is free — one more beneficiary can be added
+        vm.prank(admin);
+        pool.setAllocation(address(uint160(cap + 1)), address(usdt), 1e18, PayrollPool.Frequency.MONTHLY, block.timestamp + 1);
+        assertEq(pool.getBeneficiaries().length, cap);
+    }
+
+    function test_evictBeneficiary_revertsIfActive() public {
+        vm.prank(admin);
+        pool.setAllocation(alice, address(usdt), 1_000e18, PayrollPool.Frequency.MONTHLY, block.timestamp);
+
+        vm.prank(admin);
+        vm.expectRevert(PayrollPool.HasActiveAllocation.selector);
+        pool.evictBeneficiary(alice);
+    }
+
+    function test_evictBeneficiary_revertsIfUnclaimed() public {
+        vm.prank(admin);
+        pool.depositToken(address(usdt), 100_000e18);
+
+        vm.prank(admin);
+        pool.setAllocation(alice, address(usdt), 1_000e18, PayrollPool.Frequency.MONTHLY, block.timestamp);
+        vm.warp(block.timestamp + MONTH);
+        vm.prank(admin);
+        pool.removeAllocation(alice, address(usdt));
+
+        // claimable > 0, not yet claimed
+        vm.prank(admin);
+        vm.expectRevert(PayrollPool.HasUnclaimedBalance.selector);
+        pool.evictBeneficiary(alice);
+    }
+
+    function test_evictBeneficiary_revertsIfNotBeneficiary() public {
+        vm.prank(admin);
+        vm.expectRevert(PayrollPool.NotABeneficiary.selector);
+        pool.evictBeneficiary(alice);
+    }
+
+    function test_evictBeneficiary_revertsNonOwner() public {
+        vm.prank(admin);
+        pool.setAllocation(alice, address(usdt), 1_000e18, PayrollPool.Frequency.MONTHLY, block.timestamp);
+        vm.prank(alice);
+        vm.expectRevert();
+        pool.evictBeneficiary(alice);
+    }
+
+    function test_evictBeneficiary_cleansFactoryRegistry() public {
+        vm.prank(admin);
+        pool.depositToken(address(usdt), 100_000e18);
+
+        vm.prank(admin);
+        pool.setAllocation(alice, address(usdt), 1_000e18, PayrollPool.Frequency.MONTHLY, block.timestamp);
+        assertEq(factory.getBeneficiaryPools(alice).length, 1);
+
+        vm.warp(block.timestamp + MONTH);
+        vm.prank(admin);
+        pool.removeAllocation(alice, address(usdt));
+        vm.prank(alice);
+        pool.claim(address(usdt));
+
+        vm.prank(admin);
+        pool.evictBeneficiary(alice);
+
+        // Factory registry cleaned up
+        assertEq(factory.getBeneficiaryPools(alice).length, 0);
+    }
+
+    function test_evictBeneficiary_allowsRehire() public {
+        vm.prank(admin);
+        pool.depositToken(address(usdt), 100_000e18);
+
+        vm.prank(admin);
+        pool.setAllocation(alice, address(usdt), 1_000e18, PayrollPool.Frequency.MONTHLY, block.timestamp);
+        vm.warp(block.timestamp + MONTH);
+        vm.prank(admin);
+        pool.removeAllocation(alice, address(usdt));
+        vm.prank(alice);
+        pool.claim(address(usdt));
+
+        vm.prank(admin);
+        pool.evictBeneficiary(alice);
+
+        // All state cleared: claimable is 0, allocations is empty.
+        assertEq(pool.claimableAmount(alice, address(usdt)), 0);
+        assertEq(pool.getAllocations(alice).length, 0);
+
+        // Re-hire: alice gets re-added to pool and factory registry from scratch.
+        vm.prank(admin);
+        pool.setAllocation(alice, address(usdt), 2_000e18, PayrollPool.Frequency.MONTHLY, block.timestamp + 1);
+        assertEq(pool.getBeneficiaries().length, 1);
+        assertEq(factory.getBeneficiaryPools(alice).length, 1);
+        // Fresh allocation — no phantom accrual from pre-eviction history.
+        assertEq(pool.claimableAmount(alice, address(usdt)), 0);
+    }
+
+    // =========================================================================
+    // SC-09: Rescue functions
+    // =========================================================================
+
+    function test_rescueETH_rescuesExcess() public {
+        vm.prank(admin);
+        pool.depositETH{value: 5 ether}();
+
+        // Simulate ETH force-sent via selfdestruct — vm.deal bypasses receive().
+        vm.deal(address(pool), address(pool).balance + 1 ether);
+
+        uint256 balBefore = admin.balance;
+        vm.prank(admin);
+        pool.rescueETH();
+
+        assertEq(admin.balance - balBefore, 1 ether);
+        assertEq(pool.poolBalance(address(0)), 5 ether); // tracked balance unchanged
+    }
+
+    function test_rescueETH_revertsNothingToRescue() public {
+        vm.prank(admin);
+        pool.depositETH{value: 3 ether}();
+        // No excess — tracked == actual.
+        vm.prank(admin);
+        vm.expectRevert(PayrollPool.NothingToRescue.selector);
+        pool.rescueETH();
+    }
+
+    function test_rescueETH_revertsNonOwner() public {
+        vm.deal(address(pool), 1 ether);
+        vm.prank(alice);
+        vm.expectRevert();
+        pool.rescueETH();
+    }
+
+    function test_rescueToken_rescuesExcess() public {
+        vm.prank(admin);
+        pool.depositToken(address(usdt), 100e18);
+
+        // Direct mint to pool bypasses depositToken — simulates accidental transfer.
+        usdt.mint(address(pool), 50e18);
+
+        uint256 balBefore = usdt.balanceOf(admin);
+        vm.prank(admin);
+        pool.rescueToken(address(usdt), 50e18);
+
+        assertEq(usdt.balanceOf(admin) - balBefore, 50e18);
+        assertEq(pool.poolBalance(address(usdt)), 100e18); // tracked balance unchanged
+    }
+
+    function test_rescueToken_revertsExceedsRescuable() public {
+        vm.prank(admin);
+        pool.depositToken(address(usdt), 100e18);
+        usdt.mint(address(pool), 50e18); // 50e18 rescuable
+
+        vm.prank(admin);
+        vm.expectRevert(PayrollPool.AmountExceedsAvailable.selector);
+        pool.rescueToken(address(usdt), 51e18);
+    }
+
+    function test_rescueToken_revertsUseRescueETH() public {
+        vm.prank(admin);
+        vm.expectRevert(PayrollPool.UseRescueETH.selector);
+        pool.rescueToken(address(0), 1 ether);
+    }
+
+    function test_rescueToken_revertsNonOwner() public {
+        usdt.mint(address(pool), 10e18);
+        vm.prank(alice);
+        vm.expectRevert();
+        pool.rescueToken(address(usdt), 10e18);
     }
 
     // =========================================================================

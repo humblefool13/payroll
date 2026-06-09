@@ -18,9 +18,17 @@ import {IPayrollFactory} from "./interfaces/IPayrollFactory.sol";
 /// When admin edits an allocation the active tranche is sealed at block.timestamp
 /// and a new tranche is pushed. Accrual math per tranche:
 ///
-///   accrued = (floor((min(endTime, now) - startTime) / periodSeconds) + 1) * amountPerPeriod
+///   effectiveEnd = endTime == 0 ? block.timestamp : endTime
 ///
-/// Total claimable = sum(accrued over all tranches) - alreadyClaimed
+///   Active tranche  (endTime == 0): skip if effectiveEnd <  startTime
+///   Sealed tranche  (endTime != 0): skip if effectiveEnd <= startTime  ← prevents phantom
+///                                   period when a tranche is sealed the same block it starts
+///
+///   accrued = (floor((effectiveEnd - startTime) / periodSeconds) + 1) * amountPerPeriod
+///
+///   The +1 makes the first period immediately claimable at startTime.
+///
+/// Total claimable = sum(accrued over all non-skipped tranches) - alreadyClaimed
 ///
 /// This guarantees: past unclaimed amounts are never touched by an edit; only
 /// periods that fall inside the new tranche use the new rate.
@@ -49,6 +57,12 @@ contract PayrollPool is Ownable, ReentrancyGuard {
     error AmountExceedsAvailable();
     error ETHTransferFailed();
     error RenounceOwnershipDisabled();
+    error TooManyBeneficiaries();
+    error NothingToRescue();
+    error UseRescueETH();
+    error NotABeneficiary();
+    error HasActiveAllocation();
+    error HasUnclaimedBalance();
 
     // -------------------------------------------------------------------------
     // Types
@@ -81,6 +95,13 @@ contract PayrollPool is Ownable, ReentrancyGuard {
     // -------------------------------------------------------------------------
 
     address public immutable factory;
+
+    // -------------------------------------------------------------------------
+    // Constants
+    // -------------------------------------------------------------------------
+
+    /// @notice Hard cap on beneficiaries per pool; keeps _totalCommitted and _freezeAllTranches within block gas limits.
+    uint256 public constant MAX_BENEFICIARIES = 50;
 
     /// @dev Guards one-time factory registration per beneficiary per pool.
     mapping(address => bool) private _everRegistered;
@@ -141,6 +162,8 @@ contract PayrollPool is Ownable, ReentrancyGuard {
     event PoolPausedEvent();
     event PoolUnpausedEvent();
     event PoolClosedEvent();
+    event Rescued(address indexed token, address indexed to, uint256 amount);
+    event BeneficiaryEvicted(address indexed beneficiary);
 
     // -------------------------------------------------------------------------
     // Modifiers
@@ -168,7 +191,7 @@ contract PayrollPool is Ownable, ReentrancyGuard {
     // Admin: deposits
     // -------------------------------------------------------------------------
 
-    function depositETH() external payable onlyOwner notClosed nonReentrant {
+    function depositETH() external payable onlyOwner nonReentrant {
         if (!IPayrollFactory(factory).tokenWhitelisted(address(0)))
             revert TokenNotWhitelisted();
         poolBalance[address(0)] += msg.value;
@@ -179,7 +202,7 @@ contract PayrollPool is Ownable, ReentrancyGuard {
     function depositToken(
         address token,
         uint256 amount
-    ) external onlyOwner notClosed nonReentrant {
+    ) external onlyOwner nonReentrant {
         if (token == address(0)) revert UseDepositETH();
         if (!IPayrollFactory(factory).tokenWhitelisted(token))
             revert TokenNotWhitelisted();
@@ -266,6 +289,8 @@ contract PayrollPool is Ownable, ReentrancyGuard {
             );
         }
         if (!_isBeneficiary[beneficiary]) {
+            if (_beneficiaries.length >= MAX_BENEFICIARIES)
+                revert TooManyBeneficiaries();
             _isBeneficiary[beneficiary] = true;
             _beneficiaries.push(beneficiary);
         }
@@ -295,6 +320,56 @@ contract PayrollPool is Ownable, ReentrancyGuard {
         if (tranches[last].endTime != 0) revert AllocationAlreadyRemoved();
         tranches[last].endTime = block.timestamp;
         emit AllocationRemoved(beneficiary, token);
+    }
+
+    /// @notice Remove a fully-settled beneficiary from the active list, freeing one slot under MAX_BENEFICIARIES.
+    ///         All allocations must be removed and all claimable balances claimed first.
+    ///         Clears all 7 beneficiary state fields for a complete clean slate; re-hiring re-registers from scratch.
+    function evictBeneficiary(
+        address beneficiary
+    ) external onlyOwner nonReentrant {
+        if (!_isBeneficiary[beneficiary]) revert NotABeneficiary();
+
+        // --- Validate: no active allocations and no unclaimed balance ---
+        address[] storage tokens = _beneficiaryTokens[beneficiary];
+        for (uint256 i = 0; i < tokens.length; i++) {
+            address token = tokens[i];
+            Tranche[] storage tranches = _tranches[beneficiary][token];
+            if (
+                tranches.length > 0 &&
+                tranches[tranches.length - 1].endTime == 0
+            ) revert HasActiveAllocation();
+            if (_claimable(beneficiary, token) > 0)
+                revert HasUnclaimedBalance();
+        }
+
+        // --- Clear per-token state ---
+        // Must iterate tokens before deleting _beneficiaryTokens (array still needed for loop).
+        for (uint256 i = 0; i < tokens.length; i++) {
+            address token = tokens[i];
+            delete _tranches[beneficiary][token];
+            delete _claimed[beneficiary][token];
+            delete _hasToken[beneficiary][token];
+        }
+        delete _beneficiaryTokens[beneficiary];
+
+        // --- Remove from _beneficiaries (swap-and-pop) ---
+        for (uint256 i = 0; i < _beneficiaries.length; i++) {
+            if (_beneficiaries[i] == beneficiary) {
+                _beneficiaries[i] = _beneficiaries[_beneficiaries.length - 1];
+                _beneficiaries.pop();
+                break;
+            }
+        }
+
+        // --- Reset registration flags ---
+        IPayrollFactory(factory).unregisterBeneficiary(
+            beneficiary,
+            address(this)
+        );
+        _everRegistered[beneficiary] = false;
+        _isBeneficiary[beneficiary] = false;
+        emit BeneficiaryEvicted(beneficiary);
     }
 
     // -------------------------------------------------------------------------
@@ -383,8 +458,20 @@ contract PayrollPool is Ownable, ReentrancyGuard {
         for (uint256 i = 0; i < tokens.length; i++) {
             address token = tokens[i];
             Tranche[] storage tranches = _tranches[beneficiary][token];
-            // Invariant: a token enters _beneficiaryTokens only via setAllocation,
-            // which atomically pushes a tranche — so tranches.length >= 1 here.
+            if (tranches.length == 0) {
+                // Invariant violation guard: unreachable in normal operation (a token only enters
+                // _beneficiaryTokens alongside a tranche push in setAllocation). Emit a safe
+                // zero-valued entry rather than panicking, preserving the correct token address.
+                result[i] = AllocationView({
+                    token: token,
+                    frequency: Frequency(0),
+                    amountPerPeriod: 0,
+                    nextClaimTime: 0,
+                    pendingAmount: 0,
+                    active: false
+                });
+                continue;
+            }
             Tranche storage last = tranches[tranches.length - 1];
             bool active = last.endTime == 0;
 
@@ -420,6 +507,37 @@ contract PayrollPool is Ownable, ReentrancyGuard {
     }
 
     // -------------------------------------------------------------------------
+    // Admin: rescue stranded funds
+    // -------------------------------------------------------------------------
+
+    /// @notice Recover ETH sent to this contract outside of depositETH (e.g. via selfdestruct).
+    ///         Only the surplus above poolBalance is rescuable; tracked payroll funds are untouched.
+    function rescueETH() external onlyOwner nonReentrant {
+        uint256 tracked = poolBalance[address(0)];
+        uint256 actual = address(this).balance;
+        uint256 excess = actual > tracked ? actual - tracked : 0;
+        if (excess == 0) revert NothingToRescue();
+        emit Rescued(address(0), msg.sender, excess);
+        _transfer(address(0), payable(msg.sender), excess);
+    }
+
+    /// @notice Recover ERC-20 tokens sent directly to this contract (bypassing depositToken).
+    ///         Only the surplus above poolBalance[token] is rescuable.
+    function rescueToken(
+        address token,
+        uint256 amount
+    ) external onlyOwner nonReentrant {
+        if (token == address(0)) revert UseRescueETH();
+        uint256 tracked = poolBalance[token];
+        uint256 actual = IERC20(token).balanceOf(address(this));
+        uint256 rescuable = actual > tracked ? actual - tracked : 0;
+        if (amount == 0 || rescuable == 0) revert NothingToRescue();
+        if (amount > rescuable) revert AmountExceedsAvailable();
+        emit Rescued(token, msg.sender, amount);
+        IERC20(token).safeTransfer(msg.sender, amount);
+    }
+
+    // -------------------------------------------------------------------------
     // Internal: accrual math
     // -------------------------------------------------------------------------
 
@@ -447,10 +565,17 @@ contract PayrollPool is Ownable, ReentrancyGuard {
             // effectiveEnd: use block.timestamp for the active (last) tranche.
             uint256 effectiveEnd = t.endTime == 0 ? block.timestamp : t.endTime;
 
-            // First claim is available at startTime itself (period 1 of 1).
-            if (effectiveEnd < t.startTime) continue;
+            // First claim is available at startTime itself (period 1 of 1) for active tranches.
+            // Sealed tranches with effectiveEnd == startTime contributed 0 elapsed time → skip.
+            if (
+                t.endTime == 0
+                    ? effectiveEnd < t.startTime
+                    : effectiveEnd <= t.startTime
+            ) continue;
 
-            uint256 periods = (effectiveEnd - t.startTime) / t.periodSeconds + 1;
+            uint256 periods = (effectiveEnd - t.startTime) /
+                t.periodSeconds +
+                1;
             totalAccrued += periods * t.amountPerPeriod;
         }
 

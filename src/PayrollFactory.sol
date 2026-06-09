@@ -74,6 +74,7 @@ contract PayrollFactory is Ownable, ReentrancyGuard {
     // -------------------------------------------------------------------------
 
     constructor(address initialOwner) Ownable(initialOwner) {
+        whitelistedTokens.push(address(0));
         tokenWhitelisted[address(0)] = true;
         emit TokenWhitelisted(address(0));
     }
@@ -136,11 +137,26 @@ contract PayrollFactory is Ownable, ReentrancyGuard {
         _beneficiaryPools[beneficiary].push(pool);
     }
 
+    /// @notice Remove a beneficiary→pool mapping. Called by a pool on eviction.
+    function unregisterBeneficiary(address beneficiary, address pool) external {
+        if (!isDeployedPool[pool]) revert NotAValidPool();
+        if (msg.sender != pool) revert OnlyPool();
+        address[] storage pools = _beneficiaryPools[beneficiary];
+        for (uint256 i = 0; i < pools.length; i++) {
+            if (pools[i] == pool) {
+                pools[i] = pools[pools.length - 1];
+                pools.pop();
+                break;
+            }
+        }
+    }
+
     /// @notice Record a fee accrual from a pool. ETH fees arrive with msg.value.
     function recordFee(address token, uint256 amount) external payable {
         if (!isDeployedPool[msg.sender]) revert NotAValidPool();
         if (token == address(0) && msg.value != amount)
             revert ETHValueMismatch();
+        if (token != address(0) && msg.value > 0) revert ETHValueMismatch();
         accruedFees[token] += amount;
     }
 

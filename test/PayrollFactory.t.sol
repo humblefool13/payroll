@@ -273,4 +273,54 @@ contract PayrollFactoryTest is Test {
         vm.expectRevert(PayrollFactory.NothingToCollect.selector);
         factory.collectFees(address(0), payable(owner));
     }
+
+    // -------------------------------------------------------------------------
+    // SC-21: getWhitelistedTokens includes ETH
+    // -------------------------------------------------------------------------
+
+    function test_getWhitelistedTokens_includesETH() public view {
+        address[] memory tokens = factory.getWhitelistedTokens();
+        assertEq(tokens.length, 1);
+        assertEq(tokens[0], address(0));
+    }
+
+    function test_getWhitelistedTokens_includesAddedTokens() public {
+        vm.prank(owner);
+        factory.whitelistToken(fakeToken);
+        address[] memory tokens = factory.getWhitelistedTokens();
+        assertEq(tokens.length, 2);
+        assertEq(tokens[0], address(0));
+        assertEq(tokens[1], fakeToken);
+    }
+
+    // -------------------------------------------------------------------------
+    // SC-07: recordFee rejects ETH for ERC-20 calls
+    // -------------------------------------------------------------------------
+
+    function test_unregisterBeneficiary_rejectsRoguePool() public {
+        address roguePool = makeAddr("roguePool");
+        vm.prank(roguePool);
+        vm.expectRevert(PayrollFactory.NotAValidPool.selector);
+        factory.unregisterBeneficiary(user2, roguePool);
+    }
+
+    function test_unregisterBeneficiary_onlyFromPool() public {
+        vm.prank(user1);
+        address pool = factory.deployPool();
+
+        vm.prank(user1);
+        vm.expectRevert(PayrollFactory.OnlyPool.selector);
+        factory.unregisterBeneficiary(user2, pool);
+    }
+
+    function test_recordFee_revertsETHValueForERC20() public {
+        vm.prank(user1);
+        address pool = factory.deployPool();
+
+        // Simulate a buggy pool calling recordFee for an ERC-20 but accidentally sending ETH.
+        vm.deal(pool, 1 ether);
+        vm.prank(pool);
+        vm.expectRevert(PayrollFactory.ETHValueMismatch.selector);
+        factory.recordFee{value: 1 ether}(fakeToken, 1 ether);
+    }
 }
