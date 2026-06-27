@@ -68,6 +68,11 @@ contract PayrollFactory is Ownable, ReentrancyGuard {
         address indexed to,
         uint256 amount
     );
+    event PoolAdminTransferred(
+        address indexed pool,
+        address indexed oldAdmin,
+        address indexed newAdmin
+    );
 
     // -------------------------------------------------------------------------
     // Constructor
@@ -174,6 +179,26 @@ contract PayrollFactory is Ownable, ReentrancyGuard {
         address beneficiary
     ) external view returns (address[] memory) {
         return _beneficiaryPools[beneficiary];
+    }
+
+    /// @notice Update the admin registry when a pool transfers ownership. Called by the pool.
+    function transferPoolAdmin(
+        address oldAdmin,
+        address newAdmin,
+        address pool
+    ) external {
+        if (!isDeployedPool[pool]) revert NotAValidPool();
+        if (msg.sender != pool) revert OnlyPool();
+        address[] storage oldPools = _adminPools[oldAdmin];
+        for (uint256 i = 0; i < oldPools.length; i++) {
+            if (oldPools[i] == pool) {
+                oldPools[i] = oldPools[oldPools.length - 1];
+                oldPools.pop();
+                break;
+            }
+        }
+        _adminPools[newAdmin].push(pool);
+        emit PoolAdminTransferred(pool, oldAdmin, newAdmin);
     }
 
     function getWhitelistedTokens() external view returns (address[] memory) {

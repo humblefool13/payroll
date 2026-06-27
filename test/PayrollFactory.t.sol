@@ -313,6 +313,26 @@ contract PayrollFactoryTest is Test {
         factory.unregisterBeneficiary(user2, pool);
     }
 
+    // -------------------------------------------------------------------------
+    // transferPoolAdmin
+    // -------------------------------------------------------------------------
+
+    function test_transferPoolAdmin_rejectsRoguePool() public {
+        address roguePool = makeAddr("roguePool");
+        vm.prank(roguePool);
+        vm.expectRevert(PayrollFactory.NotAValidPool.selector);
+        factory.transferPoolAdmin(user1, user2, roguePool);
+    }
+
+    function test_transferPoolAdmin_onlyFromPool() public {
+        vm.prank(user1);
+        address pool = factory.deployPool();
+
+        vm.prank(user1);
+        vm.expectRevert(PayrollFactory.OnlyPool.selector);
+        factory.transferPoolAdmin(user1, user2, pool);
+    }
+
     function test_recordFee_revertsETHValueForERC20() public {
         vm.prank(user1);
         address pool = factory.deployPool();

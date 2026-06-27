@@ -486,7 +486,8 @@ contract PayrollPoolTest is Test {
         pool.claim(address(usdt));
     }
 
-    function test_claim_revertsWhenPaused() public {
+    function test_claim_allowedWhilePaused() public {
+        // Pause freezes accrual but must never trap already-earned funds.
         vm.prank(admin);
         pool.depositToken(address(usdt), 100_000e18);
 
@@ -499,8 +500,8 @@ contract PayrollPoolTest is Test {
         pool.pausePool();
 
         vm.prank(alice);
-        vm.expectRevert(PayrollPool.PoolPausedError.selector);
         pool.claim(address(usdt));
+        assertEq(usdt.balanceOf(alice), 4_000e18);
     }
 
     function test_claim_allowedAfterUnpause() public {
@@ -1152,6 +1153,271 @@ contract PayrollPoolTest is Test {
         vm.prank(alice);
         vm.expectRevert();
         pool.rescueToken(address(usdt), 10e18);
+    }
+
+    // =========================================================================
+    // transferOwnership — factory registry sync
+    // =========================================================================
+
+    function test_transferOwnership_updatesFactoryRegistry() public {
+        address newAdmin = makeAddr("newAdmin");
+
+        assertEq(factory.getAdminPools(admin).length, 1);
+        assertEq(factory.getAdminPools(newAdmin).length, 0);
+
+        vm.prank(admin);
+        pool.transferOwnership(newAdmin);
+
+        assertEq(factory.getAdminPools(admin).length, 0);
+        assertEq(factory.getAdminPools(newAdmin).length, 1);
+        assertEq(factory.getAdminPools(newAdmin)[0], address(pool));
+    }
+
+    function test_transferOwnership_newOwnerCanOperate() public {
+        address newAdmin = makeAddr("newAdmin");
+        usdt.mint(newAdmin, 10_000e18);
+
+        vm.prank(admin);
+        pool.transferOwnership(newAdmin);
+
+        assertEq(pool.owner(), newAdmin);
+
+        vm.startPrank(newAdmin);
+        usdt.approve(address(pool), type(uint256).max);
+        pool.depositToken(address(usdt), 1_000e18);
+        pool.setAllocation(alice, address(usdt), 100e18, PayrollPool.Frequency.MONTHLY, block.timestamp);
+        vm.stopPrank();
+    }
+
+    function test_transferOwnership_revertsNonOwner() public {
+        address newAdmin = makeAddr("newAdmin");
+        vm.prank(alice);
+        vm.expectRevert();
+        pool.transferOwnership(newAdmin);
+    }
+
+    // =========================================================================
+    // Pause semantics — claims allowed, accrual frozen, schedule shifts
+    // =========================================================================
+
+    function test_pause_freezesAccrual() public {
+        vm.prank(admin);
+        pool.depositToken(address(usdt), 100_000e18);
+
+        uint256 start = block.timestamp;
+        vm.prank(admin);
+        pool.setAllocation(alice, address(usdt), 2_000e18, PayrollPool.Frequency.MONTHLY, start);
+
+        vm.warp(start + MONTH); // 2 periods → 4000
+        vm.prank(admin);
+        pool.pausePool();
+
+        // No matter how long the pause lasts, nothing new unlocks.
+        vm.warp(block.timestamp + 5 * MONTH);
+        assertEq(pool.claimableAmount(alice, address(usdt)), 4_000e18);
+    }
+
+    function test_unpause_resumesWhereItStopped() public {
+        vm.prank(admin);
+        pool.depositToken(address(usdt), 100_000e18);
+
+        uint256 start = block.timestamp;
+        vm.prank(admin);
+        pool.setAllocation(alice, address(usdt), 2_000e18, PayrollPool.Frequency.MONTHLY, start);
+
+        // 1.5 months in → 2 periods (4000); next boundary was start + 2*MONTH
+        vm.warp(start + MONTH + MONTH / 2);
+        assertEq(pool.claimableAmount(alice, address(usdt)), 4_000e18);
+
+        vm.prank(admin);
+        pool.pausePool();
+        vm.warp(block.timestamp + 10 days);
+        vm.prank(admin);
+        pool.unpausePool();
+
+        // Still 4000 right after unpause — the paused window granted nothing.
+        assertEq(pool.claimableAmount(alice, address(usdt)), 4_000e18);
+
+        // The next boundary shifted by exactly the pause duration.
+        vm.warp(start + 2 * MONTH + 10 days - 1);
+        assertEq(pool.claimableAmount(alice, address(usdt)), 4_000e18);
+        vm.warp(start + 2 * MONTH + 10 days);
+        assertEq(pool.claimableAmount(alice, address(usdt)), 6_000e18);
+    }
+
+    function test_unpause_scheduledStartInsidePauseWindow_firesAtUnpause() public {
+        vm.prank(admin);
+        pool.depositToken(address(usdt), 100_000e18);
+
+        uint256 start = block.timestamp + 5 days;
+        vm.prank(admin);
+        pool.setAllocation(alice, address(usdt), 1_000e18, PayrollPool.Frequency.MONTHLY, start);
+
+        vm.prank(admin);
+        pool.pausePool();
+
+        // The scheduled start passes while paused — nothing unlocks.
+        vm.warp(block.timestamp + 20 days);
+        assertEq(pool.claimableAmount(alice, address(usdt)), 0);
+
+        // On unpause the start fires immediately (clock-stop semantics).
+        vm.prank(admin);
+        pool.unpausePool();
+        assertEq(pool.claimableAmount(alice, address(usdt)), 1_000e18);
+    }
+
+    function test_unpause_futureStartBeyondPause_unchanged() public {
+        uint256 start = block.timestamp + 60 days;
+        vm.prank(admin);
+        pool.setAllocation(alice, address(usdt), 1_000e18, PayrollPool.Frequency.MONTHLY, start);
+
+        vm.prank(admin);
+        pool.pausePool();
+        vm.warp(block.timestamp + 10 days);
+        vm.prank(admin);
+        pool.unpausePool();
+
+        // Start is still in the future relative to unpause — untouched.
+        assertEq(pool.nextUnlockTime(alice, address(usdt)), start);
+    }
+
+    function test_setAllocation_revertsWhilePaused() public {
+        vm.prank(admin);
+        pool.pausePool();
+
+        vm.prank(admin);
+        vm.expectRevert(PayrollPool.PoolPausedError.selector);
+        pool.setAllocation(alice, address(usdt), 1_000e18, PayrollPool.Frequency.MONTHLY, block.timestamp);
+    }
+
+    function test_removeAllocation_whilePaused_foldsAtPauseTime() public {
+        vm.prank(admin);
+        pool.depositToken(address(usdt), 100_000e18);
+
+        uint256 start = block.timestamp;
+        vm.prank(admin);
+        pool.setAllocation(alice, address(usdt), 1_000e18, PayrollPool.Frequency.MONTHLY, start);
+
+        vm.warp(start + MONTH); // 2 periods → 2000
+        vm.prank(admin);
+        pool.pausePool();
+
+        // Removal long into the pause must fold only pre-pause accrual.
+        vm.warp(block.timestamp + 3 * MONTH);
+        vm.prank(admin);
+        pool.removeAllocation(alice, address(usdt));
+        assertEq(pool.claimableAmount(alice, address(usdt)), 2_000e18);
+    }
+
+    function test_closePool_whilePaused_settlesAtPauseTime() public {
+        vm.prank(admin);
+        pool.depositToken(address(usdt), 100_000e18);
+
+        uint256 start = block.timestamp;
+        vm.prank(admin);
+        pool.setAllocation(alice, address(usdt), 1_000e18, PayrollPool.Frequency.MONTHLY, start);
+
+        vm.warp(start + MONTH); // 2000
+        vm.prank(admin);
+        pool.pausePool();
+
+        vm.warp(block.timestamp + 2 * MONTH);
+        vm.prank(admin);
+        pool.closePool();
+
+        assertEq(pool.claimableAmount(alice, address(usdt)), 2_000e18);
+        vm.prank(alice);
+        pool.claim(address(usdt));
+        assertEq(usdt.balanceOf(alice), 2_000e18);
+    }
+
+    function test_pauseCycles_accrueOnlyUnpausedTime() public {
+        vm.prank(admin);
+        pool.depositToken(address(usdt), 100_000e18);
+
+        uint256 start = block.timestamp;
+        vm.prank(admin);
+        pool.setAllocation(alice, address(usdt), 1_000e18, PayrollPool.Frequency.MONTHLY, start);
+
+        vm.warp(start + MONTH); // 2 periods → 2000
+        assertEq(pool.claimableAmount(alice, address(usdt)), 2_000e18);
+
+        // Cycle 1: one full month paused
+        vm.prank(admin);
+        pool.pausePool();
+        vm.warp(block.timestamp + MONTH);
+        vm.prank(admin);
+        pool.unpausePool();
+        assertEq(pool.claimableAmount(alice, address(usdt)), 2_000e18);
+
+        vm.warp(block.timestamp + MONTH); // one more unpaused month → 3rd period
+        assertEq(pool.claimableAmount(alice, address(usdt)), 3_000e18);
+
+        // Cycle 2: 15 days paused
+        vm.prank(admin);
+        pool.pausePool();
+        vm.warp(block.timestamp + 15 days);
+        vm.prank(admin);
+        pool.unpausePool();
+        assertEq(pool.claimableAmount(alice, address(usdt)), 3_000e18);
+
+        vm.warp(block.timestamp + MONTH); // one more unpaused month → 4th period
+        assertEq(pool.claimableAmount(alice, address(usdt)), 4_000e18);
+    }
+
+    function test_adminWithdraw_whilePaused_usesFrozenCommitted() public {
+        vm.prank(admin);
+        pool.depositToken(address(usdt), 10_000e18);
+
+        uint256 start = block.timestamp;
+        vm.prank(admin);
+        pool.setAllocation(alice, address(usdt), 1_000e18, PayrollPool.Frequency.MONTHLY, start);
+
+        vm.warp(start + MONTH); // 2000 committed
+        vm.prank(admin);
+        pool.pausePool();
+
+        // Long pause — committed stays frozen at 2000, so 8000 is withdrawable.
+        vm.warp(block.timestamp + 12 * MONTH);
+        vm.prank(admin);
+        pool.adminWithdraw(address(usdt), 8_000e18);
+
+        vm.prank(admin);
+        vm.expectRevert(PayrollPool.AmountExceedsAvailable.selector);
+        pool.adminWithdraw(address(usdt), 1);
+    }
+
+    // =========================================================================
+    // O(1) accounting — claim cost must not grow with edit count
+    // =========================================================================
+
+    function test_manyEdits_accrualCorrect_andClaimGasBounded() public {
+        vm.prank(admin);
+        pool.depositToken(address(usdt), 100_000e18);
+
+        uint256 start = block.timestamp;
+        vm.prank(admin);
+        pool.setAllocation(alice, address(usdt), 1_000e18, PayrollPool.Frequency.MONTHLY, start);
+
+        // 50 edits, one per day. Each fold banks exactly 1 period (1 day < MONTH),
+        // and each new tranche front-loads 1 period at its startTime.
+        for (uint256 i = 1; i <= 50; i++) {
+            vm.warp(start + i * 1 days);
+            vm.prank(admin);
+            pool.setAllocation(alice, address(usdt), 1_000e18, PayrollPool.Frequency.MONTHLY, block.timestamp);
+        }
+
+        // settled = 50 × 1000 (one folded period per edit) + 1000 live front-load
+        assertEq(pool.claimableAmount(alice, address(usdt)), 51_000e18);
+
+        // Claim must be O(1): flat cost regardless of the 50-edit history.
+        vm.prank(alice);
+        uint256 gasBefore = gasleft();
+        pool.claim(address(usdt));
+        uint256 gasUsed = gasBefore - gasleft();
+        assertLt(gasUsed, 200_000);
+
+        assertEq(usdt.balanceOf(alice), 51_000e18);
     }
 
     // =========================================================================

@@ -6,5 +6,6 @@ interface IPayrollFactory {
     function tokenWhitelisted(address token) external view returns (bool);
     function registerBeneficiary(address beneficiary, address pool) external;
     function unregisterBeneficiary(address beneficiary, address pool) external;
+    function transferPoolAdmin(address oldAdmin, address newAdmin, address pool) external;
     function recordFee(address token, uint256 amount) external payable;
 }

@@ -9,29 +9,40 @@ import {IPayrollFactory} from "./interfaces/IPayrollFactory.sol";
 
 /// @notice A single payroll pool. Deployed by PayrollFactory; owned by the pool admin.
 ///
-/// Allocation model
-/// ────────────────
-/// Each (beneficiary, token) pair carries an ordered list of Tranches.
-/// A tranche represents one rate-period: "amountPerPeriod every periodSeconds,
-/// starting at startTime, ending at endTime (0 = still active)."
+/// Allocation model — O(1) accounting
+/// ──────────────────────────────────
+/// Each (beneficiary, token) pair carries at most ONE active tranche plus a
+/// `settled` accumulator of everything earned by previous (superseded/removed)
+/// tranches. When the admin edits an allocation, the active tranche's final
+/// accrual is folded into `settled` and the slot is overwritten with the new
+/// tranche. Claim cost therefore does NOT grow with the number of edits.
 ///
-/// When admin edits an allocation the active tranche is sealed at block.timestamp
-/// and a new tranche is pushed. Accrual math per tranche:
+/// Accrual of the active tranche:
 ///
-///   effectiveEnd = endTime == 0 ? block.timestamp : endTime
+///   end = paused ? pausedAt : block.timestamp      (pause freezes accrual)
+///   accrued = end >= startTime
+///       ? (floor((end - startTime) / periodSeconds) + 1) * amountPerPeriod
+///       : 0
 ///
-///   Active tranche  (endTime == 0): skip if effectiveEnd <  startTime
-///   Sealed tranche  (endTime != 0): skip if effectiveEnd <= startTime  ← prevents phantom
-///                                   period when a tranche is sealed the same block it starts
+///   The +1 makes the first period claimable at startTime itself.
 ///
-///   accrued = (floor((effectiveEnd - startTime) / periodSeconds) + 1) * amountPerPeriod
+/// Folding (edit / remove / close) uses the strict rule (end <= startTime → 0)
+/// so a tranche sealed in the same block it starts contributes nothing
+/// (phantom-period guard).
 ///
-///   The +1 makes the first period immediately claimable at startTime.
+/// Total claimable = settled + activeAccrual - alreadyClaimed
 ///
-/// Total claimable = sum(accrued over all non-skipped tranches) - alreadyClaimed
-///
-/// This guarantees: past unclaimed amounts are never touched by an edit; only
-/// periods that fall inside the new tranche use the new rate.
+/// Pause semantics
+/// ───────────────
+///   - Claims remain ALLOWED while paused (pause can never trap earned funds).
+///   - Accrual freezes at `pausedAt`; no new periods unlock during a pause.
+///   - setAllocation is disabled while paused; removeAllocation stays available
+///     (it folds only the accrual earned up to `pausedAt`).
+///   - On unpause every active tranche's schedule shifts forward by the pause
+///     duration, so accrual resumes exactly where it stopped — periods that
+///     would have unlocked during the pause are delayed, not granted
+///     retroactively. A start scheduled inside the pause window fires at the
+///     moment of unpause.
 contract PayrollPool is Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -75,10 +86,10 @@ contract PayrollPool is Ownable, ReentrancyGuard {
     }
 
     struct Tranche {
-        uint256 amountPerPeriod; // in token's smallest unit
+        uint256 amountPerPeriod; // in token's smallest unit; 0 = never allocated
         uint256 startTime; // unix timestamp of the first claimable period start
         uint256 periodSeconds; // seconds per period, derived from Frequency at creation
-        uint256 endTime; // 0 = still active; set to block.timestamp when superseded/removed
+        uint256 endTime; // 0 = active; set when superseded/removed (accrual already folded into _settled)
     }
 
     struct AllocationView {
@@ -100,16 +111,22 @@ contract PayrollPool is Ownable, ReentrancyGuard {
     // Constants
     // -------------------------------------------------------------------------
 
-    /// @notice Hard cap on beneficiaries per pool; keeps _totalCommitted and _freezeAllTranches within block gas limits.
+    /// @notice Hard cap on beneficiaries per pool; keeps the loops in
+    ///         _totalCommitted, _settleAll and unpausePool within block gas limits.
     uint256 public constant MAX_BENEFICIARIES = 50;
 
     /// @dev Guards one-time factory registration per beneficiary per pool.
     mapping(address => bool) private _everRegistered;
 
-    /// @dev Tranche history: beneficiary => token => Tranche[].
-    ///      Tranches are appended-only; earlier indices are older/sealed.
-    mapping(address beneficiary => mapping(address token => Tranche[]))
-        private _tranches;
+    /// @dev The current (or last) tranche per (beneficiary, token).
+    ///      amountPerPeriod == 0 → never allocated. endTime != 0 → inactive,
+    ///      and its accrual has already been folded into _settled.
+    mapping(address beneficiary => mapping(address token => Tranche))
+        private _alloc;
+
+    /// @dev Accrual folded out of superseded/removed tranches per (beneficiary, token).
+    mapping(address beneficiary => mapping(address token => uint256 amount))
+        private _settled;
 
     /// @dev Cumulative amount already paid out per (beneficiary, token).
     mapping(address beneficiary => mapping(address token => uint256 claimed))
@@ -129,6 +146,9 @@ contract PayrollPool is Ownable, ReentrancyGuard {
 
     bool public paused;
     bool public closed;
+
+    /// @notice Timestamp at which the current pause began; 0 when not paused.
+    uint256 public pausedAt;
 
     // -------------------------------------------------------------------------
     // Events
@@ -242,9 +262,18 @@ contract PayrollPool is Ownable, ReentrancyGuard {
 
     /// @notice Create or update an allocation for (beneficiary, token).
     ///
-    ///         Edit behaviour: the currently active tranche (if any) is sealed at
-    ///         block.timestamp, preserving every full period that already elapsed.
-    ///         A new tranche opens with the new rate starting at `startTime`.
+    ///         Edit behaviour: the currently active tranche (if any) is folded —
+    ///         every period that already unlocked stays owed — and the slot is
+    ///         overwritten with the new rate starting at `startTime`.
+    ///
+    ///         NOTE: the new tranche's first period unlocks AT `startTime`. An
+    ///         edit with startTime == now therefore grants one full new-rate
+    ///         period immediately, on top of what the old tranche already
+    ///         unlocked. To change the rate without an extra immediate payout,
+    ///         set `startTime` to the old allocation's next unlock time.
+    ///
+    ///         Disabled while paused: unpause first (unpause shifts schedules,
+    ///         and edits made mid-pause would not shift correctly).
     ///
     /// @param startTime First period-start timestamp. Must be >= block.timestamp.
     function setAllocation(
@@ -253,7 +282,7 @@ contract PayrollPool is Ownable, ReentrancyGuard {
         uint256 amountPerPeriod,
         Frequency frequency,
         uint256 startTime
-    ) external onlyOwner notClosed {
+    ) external onlyOwner notClosed notPaused {
         if (beneficiary == address(0)) revert ZeroBeneficiary();
         if (beneficiary == address(this) || beneficiary == factory)
             revert InvalidBeneficiary();
@@ -262,23 +291,19 @@ contract PayrollPool is Ownable, ReentrancyGuard {
         if (amountPerPeriod == 0) revert ZeroAmount();
         if (startTime < block.timestamp) revert StartTimeInPast();
 
-        uint256 periodSecs = _periodSeconds(frequency);
-        Tranche[] storage tranches = _tranches[beneficiary][token];
+        Tranche storage t = _alloc[beneficiary][token];
 
-        // Seal the active tranche at the current moment.
-        // floor((block.timestamp - oldStart) / period) * rate is what's owed from it.
-        if (tranches.length > 0 && tranches[tranches.length - 1].endTime == 0) {
-            tranches[tranches.length - 1].endTime = block.timestamp;
+        // Fold the active tranche's final accrual into the settled accumulator.
+        if (t.amountPerPeriod != 0 && t.endTime == 0) {
+            _seal(beneficiary, token);
         }
 
-        tranches.push(
-            Tranche({
-                amountPerPeriod: amountPerPeriod,
-                startTime: startTime,
-                periodSeconds: periodSecs,
-                endTime: 0
-            })
-        );
+        _alloc[beneficiary][token] = Tranche({
+            amountPerPeriod: amountPerPeriod,
+            startTime: startTime,
+            periodSeconds: _periodSeconds(frequency),
+            endTime: 0
+        });
 
         // One-time registration per beneficiary per pool in the factory registry.
         if (!_everRegistered[beneficiary]) {
@@ -310,21 +335,21 @@ contract PayrollPool is Ownable, ReentrancyGuard {
 
     /// @notice Permanently stop future accrual for (beneficiary, token).
     ///         All already-accrued amounts remain claimable indefinitely.
+    ///         Available while paused; folds only accrual earned up to pausedAt.
     function removeAllocation(
         address beneficiary,
         address token
     ) external onlyOwner {
-        Tranche[] storage tranches = _tranches[beneficiary][token];
-        if (tranches.length == 0) revert NoAllocation();
-        uint256 last = tranches.length - 1;
-        if (tranches[last].endTime != 0) revert AllocationAlreadyRemoved();
-        tranches[last].endTime = block.timestamp;
+        Tranche storage t = _alloc[beneficiary][token];
+        if (t.amountPerPeriod == 0) revert NoAllocation();
+        if (t.endTime != 0) revert AllocationAlreadyRemoved();
+        _seal(beneficiary, token);
         emit AllocationRemoved(beneficiary, token);
     }
 
     /// @notice Remove a fully-settled beneficiary from the active list, freeing one slot under MAX_BENEFICIARIES.
     ///         All allocations must be removed and all claimable balances claimed first.
-    ///         Clears all 7 beneficiary state fields for a complete clean slate; re-hiring re-registers from scratch.
+    ///         Clears all beneficiary state for a complete clean slate; re-hiring re-registers from scratch.
     function evictBeneficiary(
         address beneficiary
     ) external onlyOwner nonReentrant {
@@ -334,11 +359,9 @@ contract PayrollPool is Ownable, ReentrancyGuard {
         address[] storage tokens = _beneficiaryTokens[beneficiary];
         for (uint256 i = 0; i < tokens.length; i++) {
             address token = tokens[i];
-            Tranche[] storage tranches = _tranches[beneficiary][token];
-            if (
-                tranches.length > 0 &&
-                tranches[tranches.length - 1].endTime == 0
-            ) revert HasActiveAllocation();
+            Tranche storage t = _alloc[beneficiary][token];
+            if (t.amountPerPeriod != 0 && t.endTime == 0)
+                revert HasActiveAllocation();
             if (_claimable(beneficiary, token) > 0)
                 revert HasUnclaimedBalance();
         }
@@ -347,7 +370,8 @@ contract PayrollPool is Ownable, ReentrancyGuard {
         // Must iterate tokens before deleting _beneficiaryTokens (array still needed for loop).
         for (uint256 i = 0; i < tokens.length; i++) {
             address token = tokens[i];
-            delete _tranches[beneficiary][token];
+            delete _alloc[beneficiary][token];
+            delete _settled[beneficiary][token];
             delete _claimed[beneficiary][token];
             delete _hasToken[beneficiary][token];
         }
@@ -376,7 +400,9 @@ contract PayrollPool is Ownable, ReentrancyGuard {
     // Beneficiary: claim
     // -------------------------------------------------------------------------
 
-    function claim(address token) external nonReentrant notPaused {
+    /// @notice Claim everything accrued for `token`. Allowed while paused and
+    ///         after close — earned funds can never be trapped by pool state.
+    function claim(address token) external nonReentrant {
         address beneficiary = msg.sender;
         uint256 claimable = _claimable(beneficiary, token);
         if (claimable == 0) revert NothingToClaim();
@@ -398,28 +424,52 @@ contract PayrollPool is Ownable, ReentrancyGuard {
     // Admin: pool lifecycle
     // -------------------------------------------------------------------------
 
+    /// @notice Pause accrual. Beneficiaries can still claim what was already
+    ///         earned; no new periods unlock until unpausePool().
     function pausePool() external onlyOwner notClosed {
         if (paused) revert PoolAlreadyPaused();
         paused = true;
+        pausedAt = block.timestamp;
         emit PoolPausedEvent();
     }
 
+    /// @notice Resume accrual. Every active schedule shifts forward by the
+    ///         pause duration so it continues exactly where it stopped; starts
+    ///         scheduled inside the pause window fire now.
     function unpausePool() external onlyOwner notClosed {
         if (!paused) revert PoolNotPaused();
         paused = false;
+        uint256 delta = block.timestamp - pausedAt;
+        if (delta > 0) {
+            for (uint256 i = 0; i < _beneficiaries.length; i++) {
+                address b = _beneficiaries[i];
+                address[] storage tokens = _beneficiaryTokens[b];
+                for (uint256 j = 0; j < tokens.length; j++) {
+                    Tranche storage t = _alloc[b][tokens[j]];
+                    if (t.amountPerPeriod == 0 || t.endTime != 0) continue;
+                    if (t.startTime <= pausedAt) {
+                        t.startTime += delta;
+                    } else if (t.startTime < block.timestamp) {
+                        t.startTime = block.timestamp;
+                    }
+                }
+            }
+        }
+        pausedAt = 0;
         emit PoolUnpausedEvent();
     }
 
     /// @notice Permanently close the pool.
-    ///         Freezes all active tranches. Admin may still withdraw uncommitted funds.
-    ///         Beneficiaries may still claim whatever was accrued up to close time.
-    ///         Auto-unpauses so a paused-then-closed pool cannot trap beneficiary funds —
-    ///         unpausePool() carries notClosed, so without this beneficiaries could be locked out forever.
+    ///         Folds all active tranches (pause-aware: a paused pool settles at
+    ///         pausedAt). Admin may still withdraw uncommitted funds and deposit
+    ///         to cover shortfalls. Beneficiaries may still claim everything
+    ///         accrued up to close time.
     function closePool() external onlyOwner {
         if (closed) revert PoolAlreadyClosed();
+        _settleAll(); // before clearing `paused` so folding respects pausedAt
         closed = true;
         paused = false;
-        _freezeAllTranches();
+        pausedAt = 0;
         emit PoolClosedEvent();
     }
 
@@ -435,18 +485,18 @@ contract PayrollPool is Ownable, ReentrancyGuard {
     }
 
     /// @notice Next unlock timestamp for an active allocation, 0 if inactive/removed.
+    ///         While paused, returns the projected unlock assuming an immediate
+    ///         unpause (the real unlock recedes 1:1 while the pause continues).
     function nextUnlockTime(
         address beneficiary,
         address token
     ) external view returns (uint256) {
-        Tranche[] storage tranches = _tranches[beneficiary][token];
-        if (tranches.length == 0) return 0;
-        Tranche storage t = tranches[tranches.length - 1];
-        if (t.endTime != 0) return 0;
-        if (block.timestamp < t.startTime) return t.startTime;
-        uint256 periodsElapsed = (block.timestamp - t.startTime) /
-            t.periodSeconds;
-        return t.startTime + (periodsElapsed + 1) * t.periodSeconds;
+        Tranche storage t = _alloc[beneficiary][token];
+        if (t.amountPerPeriod == 0 || t.endTime != 0) return 0;
+        uint256 start = _projectedStart(t);
+        if (block.timestamp < start) return start;
+        uint256 periodsElapsed = (block.timestamp - start) / t.periodSeconds;
+        return start + (periodsElapsed + 1) * t.periodSeconds;
     }
 
     /// @notice Full allocation snapshot for a beneficiary across all tokens.
@@ -457,11 +507,11 @@ contract PayrollPool is Ownable, ReentrancyGuard {
         AllocationView[] memory result = new AllocationView[](tokens.length);
         for (uint256 i = 0; i < tokens.length; i++) {
             address token = tokens[i];
-            Tranche[] storage tranches = _tranches[beneficiary][token];
-            if (tranches.length == 0) {
-                // Invariant violation guard: unreachable in normal operation (a token only enters
-                // _beneficiaryTokens alongside a tranche push in setAllocation). Emit a safe
-                // zero-valued entry rather than panicking, preserving the correct token address.
+            Tranche storage t = _alloc[beneficiary][token];
+            if (t.amountPerPeriod == 0) {
+                // Invariant violation guard: unreachable in normal operation (a token only
+                // enters _beneficiaryTokens alongside an allocation write in setAllocation).
+                // Emit a safe zero-valued entry rather than panicking.
                 result[i] = AllocationView({
                     token: token,
                     frequency: Frequency(0),
@@ -472,24 +522,23 @@ contract PayrollPool is Ownable, ReentrancyGuard {
                 });
                 continue;
             }
-            Tranche storage last = tranches[tranches.length - 1];
-            bool active = last.endTime == 0;
+            bool active = t.endTime == 0;
 
             uint256 next = 0;
             if (active) {
-                if (block.timestamp < last.startTime) {
-                    next = last.startTime;
+                uint256 start = _projectedStart(t);
+                if (block.timestamp < start) {
+                    next = start;
                 } else {
-                    uint256 p = (block.timestamp - last.startTime) /
-                        last.periodSeconds;
-                    next = last.startTime + (p + 1) * last.periodSeconds;
+                    uint256 p = (block.timestamp - start) / t.periodSeconds;
+                    next = start + (p + 1) * t.periodSeconds;
                 }
             }
 
             result[i] = AllocationView({
                 token: token,
-                frequency: _secondsToFrequency(last.periodSeconds),
-                amountPerPeriod: last.amountPerPeriod,
+                frequency: _secondsToFrequency(t.periodSeconds),
+                amountPerPeriod: t.amountPerPeriod,
                 nextClaimTime: next,
                 pendingAmount: _claimable(beneficiary, token),
                 active: active
@@ -541,48 +590,62 @@ contract PayrollPool is Ownable, ReentrancyGuard {
     // Internal: accrual math
     // -------------------------------------------------------------------------
 
-    /// @dev Core accrual logic. For each tranche we compute how many complete
-    ///      periods elapsed within [startTime, effectiveEnd], then multiply by rate.
-    ///
-    ///      effectiveEnd = endTime if sealed, else block.timestamp.
-    ///      The first period is claimable at startTime itself (not after one full period).
-    ///      If effectiveEnd < startTime nothing is claimable from that tranche.
-    ///
-    ///      Invariant: tranches are non-overlapping and ordered by creation time.
-    ///      Sealed tranche[i].endTime == tranche[i+1] creation time (block.timestamp
-    ///      at the moment of the edit), so there is no gap or overlap in accounting.
+    /// @dev End of the accrual window for active tranches: frozen at pausedAt
+    ///      while paused, otherwise block.timestamp.
+    function _accrualEnd() internal view returns (uint256) {
+        return paused ? pausedAt : block.timestamp;
+    }
+
+    /// @dev Where the active tranche's schedule stands for VIEW purposes while
+    ///      paused: projects the post-unpause startTime as if unpause were now.
+    ///      Mirrors the shift rules in unpausePool().
+    function _projectedStart(
+        Tranche storage t
+    ) internal view returns (uint256) {
+        uint256 start = t.startTime;
+        if (!paused) return start;
+        if (start <= pausedAt) return start + (block.timestamp - pausedAt);
+        if (start < block.timestamp) return block.timestamp;
+        return start;
+    }
+
+    /// @dev Total claimable = settled + active-tranche accrual − alreadyClaimed.
+    ///      Active rule: the first period unlocks AT startTime (end == start → 1 period).
     function _claimable(
         address beneficiary,
         address token
     ) internal view returns (uint256) {
-        Tranche[] storage tranches = _tranches[beneficiary][token];
-        if (tranches.length == 0) return 0;
+        uint256 totalAccrued = _settled[beneficiary][token];
 
-        uint256 totalAccrued = 0;
-
-        for (uint256 i = 0; i < tranches.length; i++) {
-            Tranche storage t = tranches[i];
-            // effectiveEnd: use block.timestamp for the active (last) tranche.
-            uint256 effectiveEnd = t.endTime == 0 ? block.timestamp : t.endTime;
-
-            // First claim is available at startTime itself (period 1 of 1) for active tranches.
-            // Sealed tranches with effectiveEnd == startTime contributed 0 elapsed time → skip.
-            if (
-                t.endTime == 0
-                    ? effectiveEnd < t.startTime
-                    : effectiveEnd <= t.startTime
-            ) continue;
-
-            uint256 periods = (effectiveEnd - t.startTime) /
-                t.periodSeconds +
-                1;
-            totalAccrued += periods * t.amountPerPeriod;
+        Tranche storage t = _alloc[beneficiary][token];
+        if (t.amountPerPeriod != 0 && t.endTime == 0) {
+            uint256 end = _accrualEnd();
+            if (end >= t.startTime) {
+                totalAccrued +=
+                    ((end - t.startTime) / t.periodSeconds + 1) *
+                    t.amountPerPeriod;
+            }
         }
 
         uint256 alreadyClaimed = _claimed[beneficiary][token];
         // Underflow guard: totalAccrued should always >= alreadyClaimed, but be safe.
         return
             totalAccrued > alreadyClaimed ? totalAccrued - alreadyClaimed : 0;
+    }
+
+    /// @dev Fold the active tranche's final accrual into _settled and mark it ended.
+    ///      Callers must ensure the tranche is active (amountPerPeriod != 0, endTime == 0).
+    ///      Strict rule (end <= start → 0): a tranche sealed at its own startTime
+    ///      contributes nothing — phantom-period guard. Pause-aware via _accrualEnd().
+    function _seal(address beneficiary, address token) internal {
+        Tranche storage t = _alloc[beneficiary][token];
+        uint256 end = _accrualEnd();
+        if (end > t.startTime) {
+            _settled[beneficiary][token] +=
+                ((end - t.startTime) / t.periodSeconds + 1) *
+                t.amountPerPeriod;
+        }
+        t.endTime = block.timestamp;
     }
 
     function _totalCommitted(address token) internal view returns (uint256) {
@@ -593,19 +656,15 @@ contract PayrollPool is Ownable, ReentrancyGuard {
         return total;
     }
 
-    /// @dev Seals all active tranches at block.timestamp. Called once on closePool().
-    function _freezeAllTranches() internal {
-        uint256 now_ = block.timestamp;
+    /// @dev Folds every active tranche. Called once on closePool().
+    function _settleAll() internal {
         for (uint256 i = 0; i < _beneficiaries.length; i++) {
             address b = _beneficiaries[i];
             address[] storage tokens = _beneficiaryTokens[b];
             for (uint256 j = 0; j < tokens.length; j++) {
-                Tranche[] storage tranches = _tranches[b][tokens[j]];
-                if (
-                    tranches.length > 0 &&
-                    tranches[tranches.length - 1].endTime == 0
-                ) {
-                    tranches[tranches.length - 1].endTime = now_;
+                Tranche storage t = _alloc[b][tokens[j]];
+                if (t.amountPerPeriod != 0 && t.endTime == 0) {
+                    _seal(b, tokens[j]);
                 }
             }
         }
@@ -667,5 +726,18 @@ contract PayrollPool is Ownable, ReentrancyGuard {
     /// @notice Disabled — renouncing would strand uncommitted funds and admin controls.
     function renounceOwnership() public pure override {
         revert RenounceOwnershipDisabled();
+    }
+
+    /// @notice Transfer pool ownership and sync the factory's admin registry.
+    ///         Override targets the public function (not _transferOwnership) because
+    ///         _transferOwnership is called in the OZ constructor before `factory` is set.
+    function transferOwnership(address newOwner) public override onlyOwner {
+        address previousOwner = owner();
+        super.transferOwnership(newOwner);
+        IPayrollFactory(factory).transferPoolAdmin(
+            previousOwner,
+            newOwner,
+            address(this)
+        );
     }
 }
